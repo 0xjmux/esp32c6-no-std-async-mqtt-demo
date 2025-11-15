@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use bme280::i2c::AsyncBME280;
 // peripherals-related imports
 use esp_alloc as _;
 use esp_hal::{
@@ -23,11 +24,7 @@ use embassy_net::{
     Runner,
     {dns::DnsQueryType, Config as EmbassyNetConfig, StackResources},
 };
-use embassy_time::{Duration, Timer};
-
-// Temperature sensor related imports
-use crate::bmp180_async::Bmp180;
-mod bmp180_async;
+use embassy_time::{Delay, Duration, Timer};
 
 // MQTT related imports
 use rust_mqtt::{
@@ -47,6 +44,10 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
+
+// arbitrary, but can't be the same as the id you connect to the server to view the
+// messages with
+const MQTT_CLIENT_ID: &str = "clientId-x6Le3tIHu4";
 
 macro_rules! mk_static {
     ($t:ty,$val:expr) => {{
@@ -103,6 +104,7 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
+
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
@@ -123,12 +125,16 @@ async fn main(spawner: Spawner) -> ! {
     // and standard I2C clock speed
     let i2c0 = I2c::new(peripherals.I2C0, Config::default())
         .unwrap()
-        .with_sda(peripherals.GPIO1)
-        .with_scl(peripherals.GPIO2)
+        .with_sda(peripherals.GPIO2)
+        .with_scl(peripherals.GPIO3)
         .into_async();
+
+    let mut bme280 = AsyncBME280::new_primary(i2c0);
 
     let timg1 = TimerGroup::new(peripherals.TIMG1);
     esp_hal_embassy::init(timg1.timer0);
+
+    bme280.init(&mut embassy_time::Delay).await.unwrap();
 
     let config = EmbassyNetConfig::dhcpv4(Default::default());
 
@@ -198,7 +204,7 @@ async fn main(spawner: Spawner) -> ! {
             CountingRng(20000),
         );
         config.add_max_subscribe_qos(rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1);
-        config.add_client_id("clientId-8rhWgBODCl");
+        config.add_client_id(MQTT_CLIENT_ID);
         config.max_packet_size = 100;
         let mut recv_buffer = [0; 80];
         let mut write_buffer = [0; 80];
@@ -220,10 +226,11 @@ async fn main(spawner: Spawner) -> ! {
             },
         }
 
-        let mut bmp = Bmp180::new(i2c0, sleep).await;
         loop {
-            bmp.measure().await;
-            let temperature = bmp.get_temperature();
+            // In the loop:
+            let measurements = bme280.measure(&mut Delay).await.unwrap();
+
+            let temperature = measurements.temperature;
             info!("Current temperature: {}", temperature);
 
             // Convert temperature into String
@@ -243,10 +250,12 @@ async fn main(spawner: Spawner) -> ! {
                 Err(mqtt_error) => match mqtt_error {
                     ReasonCode::NetworkError => {
                         error!("MQTT Network Error");
+                        Timer::after(Duration::from_millis(1000)).await;
                         continue;
                     }
                     _ => {
                         error!("Other MQTT Error: {:?}", mqtt_error);
+                        Timer::after(Duration::from_millis(1000)).await;
                         continue;
                     }
                 },
@@ -254,8 +263,4 @@ async fn main(spawner: Spawner) -> ! {
             Timer::after(Duration::from_millis(3000)).await;
         }
     }
-}
-
-pub async fn sleep(millis: u32) {
-    Timer::after(Duration::from_millis(millis as u64)).await;
 }
